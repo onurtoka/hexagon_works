@@ -1,0 +1,791 @@
+flowchart LR
+    %% ==================== Style Definitions ====================
+    classDef incoming fill:#E3F2FD,stroke:#1E88E5,stroke-width:1px,color:#0D47A1;
+    classDef domain fill:#E8F5E9,stroke:#2E7D32,stroke-width:1px,color:#1B5E20;
+    classDef outgoing fill:#FFF3E0,stroke:#F57C00,stroke-width:1px,color:#E65100;
+    classDef custom fill:#F3E5F5,stroke:#6A1B9A,stroke-width:1px,color:#4A148C;
+    classDef main fill:#ECEFF1,stroke:#546E7A,stroke-width:1px,color:#263238;
+
+    %% ==================== Incoming Adapter Thread ====================
+    subgraph T1["Thread 1 Incoming Adapter"]
+        A[ZeroMQ DISH Socket<br/>data: raw UDP multicast bytes]
+        B[Incoming Adapter<br/>class ExtrapTrackDataZeroMQIncomingAdapter]
+        C[deserializeBinary<br/>input bytes -> ExtrapTrackData]
+        P1[Incoming Port Interface<br/>class IExtrapTrackDataIncomingPort]
+        A --> B --> C --> P1
+    end
+    class A,B,C,P1 incoming;
+
+    %% ==================== Domain Processing Thread ====================
+    subgraph T2["Thread 2 Domain Processing"]
+        Q1[(Event Queue ExtrapTrackData<br/>data: ExtrapTrackData)]
+        U[Use Case<br/>class ProcessTrackUseCase<br/>action: queue + process]
+        S[Domain Service<br/>class CalculatorService<br/>action: delay calc]
+        M[Domain Model<br/>class DelayCalcTrackData<br/>data: enriched with delay fields]
+        P1 --> Q1 --> U --> S --> M
+    end
+    class Q1,U,S,M domain;
+
+    %% ==================== Domain Outgoing Port ====================
+    subgraph T2b["Domain Outgoing Port"]
+        P2[Outgoing Port Interface<br/>class IDelayCalcTrackDataOutgoingPort]
+        M --> P2
+    end
+    class P2 domain;
+
+    %% ==================== Outgoing ZeroMQ Thread ====================
+    subgraph T3["Thread 3 Outgoing ZeroMQ"]
+        OZ[Outgoing Adapter<br/>class DelayCalcTrackDataZeroMQOutgoingAdapter]
+        Q2[(Event Queue DelayCalcTrackData<br/>data: DelayCalcTrackData)]
+        SER[serialize 96 bytes<br/>DelayCalcTrackData -> binary]
+        ZS[ZeroMQ RADIO Send<br/>data: binary UDP multicast]
+        P2 --> OZ --> Q2 --> SER --> ZS
+    end
+    class OZ,Q2,SER,ZS outgoing;
+
+    %% ==================== Outgoing Custom Thread ====================
+    subgraph T4["Thread 4 Outgoing Custom"]
+        OC[Outgoing Adapter<br/>class DelayCalcTrackDataCustomOutgoingAdapter]
+        Q3[(Event Queue DelayCalcTrackData<br/>data: DelayCalcTrackData)]
+        EX[Extract FirstHopDelayTime<br/>data: int64 delay]
+        BUF[Batch Buffer 200 samples<br/>data: delay array]
+        AVG[Arithmetic Mean<br/>output: mean delay]
+        P2 --> OC --> Q3 --> EX --> BUF --> AVG
+    end
+    class OC,Q3,EX,BUF,AVG custom;
+
+    %% ==================== Main Thread ====================
+    subgraph T5["Thread 5 Main Lifecycle"]
+        MAIN[Entry Point main.cpp<br/>start/stop order]
+        MAIN --> B
+        MAIN --> U
+        MAIN --> OZ
+        MAIN --> OC
+    end
+    class MAIN main;
+
+
+Teknik Akış (Uçtan Uca)
+0) Uygulama başlatma (main)
+
+    Dosya: src/b_hexagon/main.cpp
+
+    Amaç: Tüm bileşenleri doğru sırada başlatmak ve kapatmak.
+
+    Akış:
+
+        Logger init ve signal handler kurulumu (SIGINT/SIGTERM).
+
+        CalculatorService oluşturulur.
+
+        Outgoing adapterlar oluşturulur:
+
+            DelayCalcTrackDataZeroMQOutgoingAdapter
+
+            DelayCalcTrackDataCustomOutgoingAdapter
+
+        ProcessTrackUseCase (domain) bu adapter listesi ile kurulur.
+
+        Incoming adapter (ExtrapTrackDataZeroMQIncomingAdapter) oluşturulur.
+
+        Bileşenler sıra ile başlatılır:
+
+            Outgoing adapterlar → Domain → Incoming
+
+        main thread bekleme döngüsüne girer.
+
+        Ctrl+C gelince ters sırada kapatır:
+
+            Incoming → Domain → Outgoing
+
+1) Incoming: dış sistemden veri alma
+
+    Dosyalar:
+    adapters/incoming/zeromq/ExtrapTrackDataZeroMQIncomingAdapter.*
+
+    Teknik detay:
+
+        ZeroMQ DISH socket kullanılır (UDP multicast).
+
+        Socket, endpoint’e bind olur ve group’a join eder.
+
+        Worker thread sürekli recv() yapar.
+
+Gelen veri:
+
+    Tip: Binary UDP multicast mesajı
+
+    İçerik: ExtrapTrackData modelinin binary formatı (76 byte)
+
+İşlem:
+
+    Binary payload alınır.
+
+    deserializeBinary çağrılır.
+
+    Payload → ExtrapTrackData objesi (C++ tarafında struct-like model).
+
+    Bu obje incoming port üzerinden domain’e verilir:
+
+        IExtrapTrackDataIncomingPort::submitExtrapTrackData(...)
+
+2) Domain giriş portu: veriyi kuyruğa koyma
+
+    Dosyalar:
+    domain/logic/ProcessTrackUseCase.*
+    domain/ports/incoming/IExtrapTrackDataIncomingPort.hpp
+
+    Teknik detay:
+
+        ProcessTrackUseCase, IExtrapTrackDataIncomingPort’u uygular.
+
+        submitExtrapTrackData(...) çağrısı non-blocking çalışır.
+
+        Gelen ExtrapTrackData doğrulanır (isValid()).
+
+Gelen veri:
+
+    ExtrapTrackData
+
+İşlem:
+
+    Validasyon yapılır.
+
+    eventQueue_ içine push edilir.
+
+    Domain thread’e signal verilir (condition_variable).
+
+3) Domain thread: işleme ve dönüşüm
+
+    Dosyalar:
+    domain/logic/ProcessTrackUseCase.*
+    domain/logic/CalculatorService.*
+
+    Teknik detay:
+
+        ProcessTrackUseCase::process() ayrı bir thread’dir.
+
+        Event queue’dan FIFO şekilde veri çeker.
+
+        CalculatorService::calculateDelay(...) ile dönüşüm yapar.
+
+Gelen veri:
+
+    ExtrapTrackData
+
+Çıkan veri:
+
+    DelayCalcTrackData
+
+Dönüşüm mantığı (CalculatorService):
+
+    firstHopDelayTime = currentTime - firstHopSentTime
+
+    secondHopSentTime = currentTime
+
+    Diğer alanlar (pos/vel/time) kopyalanır.
+
+4) Domain outgoing port: dış dünyaya aktarım
+
+    Dosya: domain/ports/outgoing/IDelayCalcTrackDataOutgoingPort.hpp
+
+    Teknik detay:
+
+        Domain, DelayCalcTrackData’yı port arayüzüne gönderir.
+
+        Birden fazla adapter olabilir (vector).
+
+Gelen veri:
+
+    DelayCalcTrackData
+
+Gönderilen hedefler:
+
+    ZeroMQ outgoing adapter
+
+    Custom analytics adapter
+
+5) Outgoing ZeroMQ Adapter
+
+    Dosyalar:
+    adapters/outgoing/zeromq/DelayCalcTrackDataZeroMQOutgoingAdapter.*
+
+    Teknik detay:
+
+        Non-blocking enqueue (domain’i bloklamaz).
+
+        Kendi worker thread’inde serialize + send yapar.
+
+        ZeroMQ RADIO socket ile UDP multicast gönderir.
+
+Gelen veri:
+
+    DelayCalcTrackData
+
+İşlem:
+
+    sendDelayCalcTrackData(...) → event queue
+
+    Worker thread:
+
+        serialize() → 96 byte binary
+
+        RADIO socket ile gönderim
+
+Çıkan veri:
+
+    Binary UDP multicast mesajı (DelayCalcTrackData formatında)
+
+6) Outgoing Custom Adapter (Analytics)
+
+    Dosyalar:
+    adapters/outgoing/custom/DelayCalcTrackDataCustomOutgoingAdapter.*
+
+    Teknik detay:
+
+        Non-blocking enqueue.
+
+        Kendi thread’inde FirstHopDelayTime değerlerini toplar.
+
+        200 örnekte bir aritmetik ortalama hesaplar.
+
+Gelen veri:
+
+    DelayCalcTrackData
+
+İşlem:
+
+    Queue’ya girer.
+
+    firstHopDelayTime çıkarılır.
+
+    200 örnek buffer’da birikir.
+
+    Ortalama hesaplanır (arithmeticMean güncellenir).
+
+Çıkan veri:
+
+    Console/log üzerinden ortalama raporu (veya dahili state).
+
+Özet Akış (kısa)
+
+    ZeroMQ DISH UDP multicast → raw bytes
+
+    Deserialize → ExtrapTrackData
+
+    Domain queue → ProcessTrackUseCase
+
+    CalculatorService → DelayCalcTrackData
+
+    Outgoing port →
+
+        ZeroMQ RADIO (binary yayın)
+
+        Custom adapter (200 örnek ortalama)
+
+
+✅ Uçtan Uca Akış – Cheat Sheet (Dosya + Fonksiyon + Veri)
+1) Giriş Noktası (Bootstrap / Lifecycle)
+
+Dosya: src/b_hexagon/main.cpp
+Fonksiyon: int main()
+İş: Sistem bileşenlerini oluşturur ve doğru sırada başlatır.
+Önemli noktalar:
+
+    Outgoing adapterlar → Domain → Incoming başlatma sırası
+
+    Ctrl+C ile graceful shutdown
+
+2) Incoming Adapter (ZeroMQ DISH)
+
+Dosya: adapters/incoming/zeromq/ExtrapTrackDataZeroMQIncomingAdapter.cpp
+Sınıf: ExtrapTrackDataZeroMQIncomingAdapter
+Fonksiyonlar:
+
+    start() → socket açılır, thread başlatılır
+
+    process() → recv loop
+
+    deserializeBinary(...) → bytes → model
+
+Girdi: UDP multicast binary mesaj
+Çıktı: ExtrapTrackData modeli
+3) Incoming Port (Domain’e giriş)
+
+Dosya: domain/ports/incoming/IExtrapTrackDataIncomingPort.hpp
+Arayüz: IExtrapTrackDataIncomingPort
+Metod: submitExtrapTrackData(const ExtrapTrackData&)
+
+Girdi: ExtrapTrackData
+Çıktı: Domain event queue’ya enqueue
+4) Domain Use Case (Event Queue + Thread)
+
+Dosyalar:
+
+    domain/logic/ProcessTrackUseCase.hpp
+
+    domain/logic/ProcessTrackUseCase.cpp
+
+Sınıf: ProcessTrackUseCase
+Fonksiyonlar:
+
+    submitExtrapTrackData(...)
+
+    enqueueMessage(...)
+
+    process() (worker thread)
+
+    processTrackData(...)
+
+Girdi: ExtrapTrackData
+Çıktı: DelayCalcTrackData
+5) Domain Service (Delay Calculation)
+
+Dosyalar:
+
+    domain/logic/CalculatorService.hpp
+
+    domain/logic/CalculatorService.cpp
+    Arayüz: ICalculatorService
+    Sınıf: CalculatorService
+
+Fonksiyon:
+
+    calculateDelay(const ExtrapTrackData&)
+
+Girdi: ExtrapTrackData
+Çıktı: DelayCalcTrackData
+Dönüşüm:
+
+    firstHopDelayTime = now - firstHopSentTime
+
+    secondHopSentTime = now
+
+    diğer alanlar kopyalanır
+
+6) Outgoing Port (Domain’den çıkış)
+
+Dosya: domain/ports/outgoing/IDelayCalcTrackDataOutgoingPort.hpp
+Arayüz: IDelayCalcTrackDataOutgoingPort
+Metod: sendDelayCalcTrackData(const DelayCalcTrackData&)
+
+Girdi: DelayCalcTrackData
+Çıktı: Adapterlara dispatch
+7) Outgoing Adapter – ZeroMQ RADIO
+
+Dosyalar:
+
+    adapters/outgoing/zeromq/DelayCalcTrackDataZeroMQOutgoingAdapter.hpp
+
+    adapters/outgoing/zeromq/DelayCalcTrackDataZeroMQOutgoingAdapter.cpp
+
+Sınıf: DelayCalcTrackDataZeroMQOutgoingAdapter
+Fonksiyonlar:
+
+    sendDelayCalcTrackData(...) (enqueue)
+
+    process() (worker thread)
+
+    serialize() (model → bytes)
+
+Girdi: DelayCalcTrackData
+Çıktı: UDP multicast binary mesaj (96 byte)
+8) Outgoing Adapter – Custom Analytics
+
+Dosyalar:
+
+    adapters/outgoing/custom/DelayCalcTrackDataCustomOutgoingAdapter.hpp
+
+    adapters/outgoing/custom/DelayCalcTrackDataCustomOutgoingAdapter.cpp
+
+Sınıf: DelayCalcTrackDataCustomOutgoingAdapter
+Fonksiyonlar:
+
+    sendDelayCalcTrackData(...) (enqueue)
+
+    process() (worker thread)
+
+    updateArithmeticMean(...)
+
+Girdi: DelayCalcTrackData
+Çıktı:
+
+    FirstHopDelayTime örnekleri
+
+    200 örnekte bir arith mean
+
+9) Model Katmanı (Veri yapıları)
+
+Dosyalar:
+
+    domain/ports/incoming/ExtrapTrackData.hpp
+
+    domain/model/ExtrapTrackData.cpp
+
+    domain/ports/outgoing/DelayCalcTrackData.hpp
+
+    domain/model/DelayCalcTrackData.cpp
+
+Görev:
+
+    Field validasyonu
+
+    serialize/deserialize
+
+🔎 Önerilen okuma sırası (tek satır)
+
+    main.cpp
+
+    ProcessTrackUseCase.hpp/.cpp
+
+    CalculatorService.hpp/.cpp
+
+    IExtrapTrackDataIncomingPort.hpp
+
+    IDelayCalcTrackDataOutgoingPort.hpp
+
+    ExtrapTrackData.hpp/.cpp
+
+    DelayCalcTrackData.hpp/.cpp
+
+    ExtrapTrackDataZeroMQIncomingAdapter.*
+
+    DelayCalcTrackDataZeroMQOutgoingAdapter.*
+
+    DelayCalcTrackDataCustomOutgoingAdapter.*
+
+
+1) Büyük Resim: Bu sistem ne yapıyor?
+
+Bu uygulama, dış sistemden (ZeroMQ UDP multicast) “track” verisi alıyor, veriyi domain katmanında işliyor (gecikme hesaplıyor) ve çıktıyı hem ZeroMQ ile yayınlıyor hem de custom analiz yapıyor.
+Referans: src/b_hexagon/main.cpp, domain/logic/ProcessTrackUseCase.*, domain/logic/CalculatorService.*, outgoing adapterlar.
+2) Kritik Bileşenler ve Ne İşe Yararlar?
+2.1. Main (Orchestrator / Lifecycle)
+
+    Dosya: src/b_hexagon/main.cpp
+
+    Görev: Sistem bileşenlerini oluşturur, başlatır ve düzgün şekilde kapatır.
+
+    Neden önemli?
+
+        Doğru başlatma sırasını yönetiyor:
+        Outgoing → Domain → Incoming
+        Bu sayede veri gelmeden önce downstream hazır olur.
+
+    Thread sayısı ve sorumluluklar burada yorum satırlarında da açıkça belirtilmiş.
+    Referans: main.cpp
+
+2.2. Domain Use Case – ProcessTrackUseCase
+
+    Dosyalar:
+
+        domain/logic/ProcessTrackUseCase.hpp
+
+        domain/logic/ProcessTrackUseCase.cpp
+
+    Görev:
+
+        Incoming adapterdan gelen veriyi alır.
+
+        Event queue’ya koyar.
+
+        Kendi thread’inde bu kuyruğu işleyerek domain mantığını çalıştırır.
+
+    Neden önemli?
+    Bu sınıf, iş akışının merkezi.
+
+    Kritik noktalar:
+
+        Event queue: veri akışını buffer’lar.
+
+        Non-blocking enqueue: incoming thread’i beklemez.
+
+        Thread-safe queue: mutex + condition_variable ile korunur.
+
+2.3. Domain Service – CalculatorService
+
+    Dosyalar:
+
+        domain/logic/CalculatorService.hpp
+
+        domain/logic/CalculatorService.cpp
+
+    Görev:
+
+        ExtrapTrackData → DelayCalcTrackData dönüşümünü yapar.
+
+        firstHopDelayTime hesaplar.
+
+    Neden önemli?
+    İş mantığının “core” kısmı burada.
+
+2.4. Ports (Hexagonal Pattern)
+
+    Incoming Port: domain/ports/incoming/IExtrapTrackDataIncomingPort.hpp
+
+    Outgoing Port: domain/ports/outgoing/IDelayCalcTrackDataOutgoingPort.hpp
+
+Ne işe yarar?
+
+    Domain’in dış dünyadan bağımsız kalmasını sağlar.
+
+    Adapterlar bu portları uygular ya da çağırır.
+
+    Böylece “ZeroMQ değişse bile domain değişmez.”
+
+2.5. Incoming Adapter (ZeroMQ DISH)
+
+    Dosyalar:
+
+        adapters/incoming/zeromq/ExtrapTrackDataZeroMQIncomingAdapter.hpp/.cpp
+
+    Görev:
+
+        UDP multicast ile binary mesaj alır.
+
+        Deserialize edip ExtrapTrackData oluşturur.
+
+        Domain’e submitExtrapTrackData ile verir.
+
+2.6. Outgoing Adapter (ZeroMQ RADIO)
+
+    Dosyalar:
+
+        adapters/outgoing/zeromq/DelayCalcTrackDataZeroMQOutgoingAdapter.hpp/.cpp
+
+    Görev:
+
+        Domain’den gelen DelayCalcTrackData’yı alır.
+
+        Binary serialize edip UDP multicast ile yayınlar.
+
+    Önemli nokta:
+
+        Kendine ait queue + background thread kullanır → domain’i bloklamaz.
+
+2.7. Outgoing Adapter (Custom Analytics)
+
+    Dosyalar:
+
+        adapters/outgoing/custom/DelayCalcTrackDataCustomOutgoingAdapter.hpp/.cpp
+
+    Görev:
+
+        DelayCalcTrackData içinden FirstHopDelayTime örneklerini toplar.
+
+        200 örnekte bir aritmetik ortalama hesaplar.
+
+2.8. Model Katmanı (Data Structures)
+
+    ExtrapTrackData
+
+        domain/ports/incoming/ExtrapTrackData.hpp
+
+        domain/model/ExtrapTrackData.cpp
+
+    DelayCalcTrackData
+
+        domain/ports/outgoing/DelayCalcTrackData.hpp
+
+        domain/model/DelayCalcTrackData.cpp
+
+Ne işe yarar?
+
+    Serialization / deserialization
+
+    Validation
+
+    Sabit binary boyut (76 byte / 96 byte)
+
+3) C++ Bilmeyenler için Önemli “Keyword / Kavram” Rehberi
+3.1. Thread
+
+    Nedir? Aynı anda çalışan bağımsız iş parçacığı.
+
+    Kodda nerede?
+
+        Incoming adapter thread
+
+        Domain processing thread
+
+        Outgoing adapter thread
+
+    Neden var?
+
+        Network I/O, domain işlem ve çıkış I/O birbirini bloklamasın diye.
+        Referans: main.cpp, ProcessTrackUseCase.*, outgoing adapterlar.
+
+3.2. Queue (Event Queue)
+
+    Nedir? Gelen verilerin sıraya girdiği buffer.
+
+    Kodda nerede?
+
+        ProcessTrackUseCase içindeki eventQueue_
+
+        Outgoing adapterların message queue’ları
+
+    Neden var?
+
+        Producer (incoming) ile consumer (domain) hızları farklı olabilir.
+        Referans: ProcessTrackUseCase.hpp/.cpp, outgoing adapterlar.
+
+3.3. Mutex + Condition Variable
+
+    Nedir? Thread-safe erişim ve “bekle/uyandır” mekanizması.
+
+    Kodda nerede?
+
+        Event queue erişimlerinde (queueMutex_, queueCV_)
+
+    Neden var?
+
+        Queue’ya aynı anda yazma/okuma olabilir → race condition önlenir.
+        Referans: ProcessTrackUseCase.hpp/.cpp, outgoing adapterlar.
+
+3.4. std::unique_ptr / std::shared_ptr
+
+    Nedir? Otomatik bellek yönetimi (smart pointer).
+
+    Kodda nerede?
+
+        Domain servisleri ve adapterlar oluşturulurken.
+
+    Farkları:
+
+        unique_ptr: Tek sahip (ownership)
+
+        shared_ptr: Paylaşımlı sahiplik (birden fazla kullanıcı)
+
+    Neden kullanılmış?
+
+        Memory leak olmaması
+
+        Aynı adapterın birden fazla bileşen tarafından paylaşılması
+        Referans: main.cpp, ProcessTrackUseCase.hpp
+
+3.5. Interface (Abstract Class)
+
+    Nedir? Uygulaması olmayan, sadece “sözleşme” veren sınıf.
+
+    Kodda nerede?
+
+        IExtrapTrackDataIncomingPort
+
+        IDelayCalcTrackDataOutgoingPort
+
+        ICalculatorService
+
+    Neden var?
+
+        Hexagonal Architecture
+
+        Mock/test imkanı
+        Referans: port ve service interface dosyaları.
+
+3.6. Serialize / Deserialize
+
+    Nedir?
+
+        Nesne → byte dizisi (serialize)
+
+        Byte dizisi → nesne (deserialize)
+
+    Kodda nerede?
+
+        ExtrapTrackData::serialize/deserialize
+
+        DelayCalcTrackData::serialize/deserialize
+
+    Neden var?
+
+        ZeroMQ üzerinden ham binary taşımak için.
+        Referans: model dosyaları ve adapterlar.
+
+3.7. Atomic flag (std::atomic<bool>)
+
+    Nedir? Thread-safe boolean.
+
+    Kodda nerede?
+
+        running_ flag’leri (threadleri durdurmak için)
+
+    Neden var?
+
+        Threadler güvenli şekilde kapanabilsin diye.
+        Referans: main.cpp, adapters, ProcessTrackUseCase.*
+
+3.8. Dependency Injection
+
+    Nedir?
+    Bir sınıfın bağımlılıklarını dışarıdan alması.
+
+    Kodda nerede?
+
+        ProcessTrackUseCase constructor’ları
+
+    Neden var?
+
+        Test edilebilirlik
+
+        Domain’in dış dünyaya bağlı olmaması
+        Referans: ProcessTrackUseCase.hpp
+
+3.9. ZeroMQ DISH / RADIO
+
+    DISH: UDP multicast subscriber
+
+    RADIO: UDP multicast publisher
+
+    Kodda nerede?
+
+        Incoming adapter: DISH
+
+        Outgoing adapter: RADIO
+        Referans: adapter dosyaları.
+
+4) Özet: “Kritik her yer” neden kritik?
+
+    Thread ve queue: gerçek zamanlı, non-blocking işleme için.
+
+    Port/interface: Hexagonal mimari + test edilebilirlik.
+
+    Smart pointers: memory yönetimi ve ownership kontrolü.
+
+    ZeroMQ: düşük gecikmeli UDP multicast iletişim.
+
+    Serialization: veriyi ağ üzerinden taşımak için.
+
+Kullandığım Dosyalar (Referans)
+
+    src/b_hexagon/main.cpp
+
+    domain/logic/ProcessTrackUseCase.hpp/.cpp
+
+    domain/logic/CalculatorService.hpp/.cpp
+
+    domain/logic/ICalculatorService.hpp
+
+    domain/ports/incoming/IExtrapTrackDataIncomingPort.hpp
+
+    domain/ports/outgoing/IDelayCalcTrackDataOutgoingPort.hpp
+
+    domain/ports/incoming/ExtrapTrackData.hpp
+
+    domain/ports/outgoing/DelayCalcTrackData.hpp
+
+    adapters/incoming/zeromq/ExtrapTrackDataZeroMQIncomingAdapter.hpp/.cpp
+
+    adapters/outgoing/zeromq/DelayCalcTrackDataZeroMQOutgoingAdapter.hpp/.cpp
+
+    adapters/outgoing/custom/DelayCalcTrackDataCustomOutgoingAdapter.hpp/.cpp
+
+    utils/Logger.hpp
+
+Kullandığım Komutlar
+
+    find /workspace/b_hexagon_multithread/b_hexagon -maxdepth 3 -type d -print
+
+    find /workspace/b_hexagon_multithread/b_hexagon/src/b_hexagon -type f -maxdepth 6 -print
+
+    sed -n '1,200p' ... (çeşitli dosyalar için)
